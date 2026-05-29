@@ -115,8 +115,8 @@ seoul-apartment-price-prediction/
 │   └── processed/                    # 모델링에 사용할 최종 데이터
 ├── notebooks/                        # 단계별 분석 노트북
 │   ├── 01_data_collection.ipynb      # 데이터 수집 과정
-│   ├── 02_data_cleaning.ipynb        # 결측치, 타입, 이상치 등 정제 과정
-│   ├── 03_feature_engineering.ipynb  # 파생 변수 생성 및 외부 데이터 결합
+│   ├── 02_data_cleaning.ipynb        # 기본 정제 + 기본 파생 변수 (연식, ㎡당 가격, 주소 후보)
+│   ├── 03_feature_engineering.ipynb  # 외부 데이터 결합 및 추가 파생 변수 생성
 │   ├── 04_eda.ipynb                  # 탐색적 데이터 분석 및 시각화
 │   └── 05_modeling.ipynb             # 머신러닝 모델 학습 및 평가
 ├── src/                              # 반복 사용할 Python 코드
