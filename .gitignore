@@ -2,6 +2,8 @@
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
+.matplotlib/
+.cache/
 
 # Virtual environments
 .venv/
@@ -13,6 +15,8 @@ data/raw/*
 data/external/*
 data/interim/*
 data/processed/*
+reports/figures/*
+reports/model_*
 !data/raw/.gitkeep
 !data/external/.gitkeep
 !data/interim/.gitkeep
@@ -23,3 +27,4 @@ data/processed/*
 
 # Environment variables
 .env
+.env.example
