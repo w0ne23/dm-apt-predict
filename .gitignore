@@ -28,3 +28,6 @@ reports/model_*
 # Environment variables
 .env
 .env.example
+
+# VS Code
+.history/
