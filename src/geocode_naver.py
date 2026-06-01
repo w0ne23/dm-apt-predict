@@ -4,6 +4,7 @@ import argparse
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -140,6 +141,85 @@ def geocode_address(
     }
 
 
+def geocode_error_row(
+    address: str,
+    error_message: str,
+    address_col: str = "full_road_address",
+) -> dict[str, Any]:
+    return {
+        address_col: address,
+        "geocode_status": "error",
+        "matched_address": pd.NA,
+        "road_address": pd.NA,
+        "jibun_address": pd.NA,
+        "latitude": pd.NA,
+        "longitude": pd.NA,
+        "error_message": error_message,
+    }
+
+
+def retry_delay_seconds(exc: Exception, attempt: int, base_delay: float) -> float | None:
+    if isinstance(exc, requests.HTTPError):
+        status_code = exc.response.status_code if exc.response is not None else None
+        if status_code == 429:
+            retry_after = exc.response.headers.get("Retry-After") if exc.response else None
+            if retry_after:
+                try:
+                    return float(retry_after)
+                except ValueError:
+                    pass
+            return base_delay * (2 ** (attempt - 1))
+        if status_code is not None and 500 <= status_code < 600:
+            return base_delay * (2 ** (attempt - 1))
+        return None
+
+    if isinstance(
+        exc,
+        (
+            requests.ConnectionError,
+            requests.Timeout,
+            requests.RequestException,
+            ValueError,
+        ),
+    ):
+        return base_delay * (2 ** (attempt - 1))
+
+    return None
+
+
+def geocode_address_with_retry(
+    address: str,
+    client_id: str,
+    client_secret: str,
+    address_col: str = "full_road_address",
+    timeout: int = 10,
+    max_retries: int = 3,
+    retry_base_delay: float = 1.0,
+) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for attempt in range(1, max_retries + 2):
+        try:
+            return geocode_address(
+                address,
+                client_id,
+                client_secret,
+                address_col=address_col,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            last_error = exc
+            delay = retry_delay_seconds(exc, attempt, retry_base_delay)
+            if delay is None or attempt > max_retries:
+                break
+            time.sleep(delay)
+
+    return geocode_error_row(
+        address,
+        str(last_error) if last_error is not None else "unknown geocoding error",
+        address_col=address_col,
+    )
+
+
 def load_existing_cache(path: Path) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
@@ -153,7 +233,11 @@ def geocode_unique_addresses(
     sleep_seconds: float = 0.1,
     limit: int | None = None,
     force: bool = False,
+    max_workers: int = 3,
+    max_retries: int = 3,
+    retry_base_delay: float = 1.0,
 ) -> pd.DataFrame:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     source = pd.read_csv(input_path, encoding="utf-8-sig", usecols=[address_col])
     addresses = (
         source[address_col]
@@ -182,34 +266,45 @@ def geocode_unique_addresses(
     rows = [] if force or cache.empty else cache.to_dict("records")
     pending = [address for address in addresses if address not in cached_addresses]
 
-    for index, address in enumerate(pending, start=1):
-        try:
-            rows.append(
-                geocode_address(
-                    address,
-                    client_id,
-                    client_secret,
-                    address_col=address_col,
-                )
-            )
-        except Exception as exc:
-            rows.append(
-                {
-                    address_col: address,
-                    "geocode_status": "error",
-                    "matched_address": pd.NA,
-                    "road_address": pd.NA,
-                    "jibun_address": pd.NA,
-                    "latitude": pd.NA,
-                    "longitude": pd.NA,
-                    "error_message": str(exc),
-                }
-            )
+    if pending:
+        print(
+            f"geocoding pending addresses: {len(pending):,} "
+            f"(max_workers={max_workers}, max_retries={max_retries})"
+        )
 
-        if index % 100 == 0 or index == len(pending):
-            print(f"geocoded {index:,}/{len(pending):,} pending addresses")
+    completed = 0
+    max_workers = max(1, max_workers)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_address = {}
+        for address in pending:
+            future = executor.submit(
+                geocode_address_with_retry,
+                address,
+                client_id,
+                client_secret,
+                address_col,
+                10,
+                max_retries,
+                retry_base_delay,
+            )
+            future_to_address[future] = address
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
+
+        for future in as_completed(future_to_address):
+            address = future_to_address[future]
+            try:
+                rows.append(future.result())
+            except Exception as exc:
+                rows.append(geocode_error_row(address, str(exc), address_col=address_col))
+
+            completed += 1
+            if completed % 100 == 0 or completed == len(pending):
+                print(f"geocoded {completed:,}/{len(pending):,} pending addresses")
+                pd.DataFrame(rows).to_csv(output_path, index=False, encoding="utf-8-sig")
+
+        if not pending:
             pd.DataFrame(rows).to_csv(output_path, index=False, encoding="utf-8-sig")
-        time.sleep(sleep_seconds)
 
     result = pd.DataFrame(rows)
     result = result.drop_duplicates(subset=[address_col], keep="last")
@@ -262,6 +357,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--address-col", default="full_road_address")
     parser.add_argument("--sleep-seconds", type=float, default=0.1)
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=3,
+        help="동시에 요청할 지오코딩 작업 수입니다.",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=3,
+        help="일시적 오류 발생 시 주소별 최대 재시도 횟수입니다.",
+    )
+    parser.add_argument(
+        "--retry-base-delay",
+        type=float,
+        default=1.0,
+        help="재시도 지수 백오프의 기본 대기 시간(초)입니다.",
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--force", action="store_true")
     parser.add_argument(
@@ -282,6 +395,9 @@ def main() -> None:
             sleep_seconds=args.sleep_seconds,
             limit=args.limit,
             force=args.force,
+            max_workers=args.max_workers,
+            max_retries=args.max_retries,
+            retry_base_delay=args.retry_base_delay,
         )
     merged = merge_coordinates(
         apartment_path=args.input,
