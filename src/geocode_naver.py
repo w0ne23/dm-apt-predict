@@ -233,7 +233,7 @@ def geocode_unique_addresses(
     sleep_seconds: float = 0.1,
     limit: int | None = None,
     force: bool = False,
-    max_workers: int = 3,
+    max_workers: int = 5,
     max_retries: int = 3,
     retry_base_delay: float = 1.0,
 ) -> pd.DataFrame:
@@ -360,7 +360,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=3,
+        default=5,
         help="동시에 요청할 지오코딩 작업 수입니다.",
     )
     parser.add_argument(
