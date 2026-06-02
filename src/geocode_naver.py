@@ -14,6 +14,16 @@ import requests
 
 NAVER_GEOCODE_URL = "https://maps.apigw.ntruss.com/map-geocode/v2/geocode"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+RETRYABLE_CACHE_STATUSES = ("error",)
+GEOCODE_RESULT_COLUMNS = [
+    "geocode_status",
+    "matched_address",
+    "road_address",
+    "jibun_address",
+    "latitude",
+    "longitude",
+    "error_message",
+]
 
 
 def load_env_file(path: Path = PROJECT_ROOT / ".env") -> None:
@@ -56,6 +66,28 @@ def is_too_coarse_address(address: str) -> bool:
     return bool(re.fullmatch(r"서울특별시\s+\S+구", str(address).strip()))
 
 
+def normalize_address_value(value: Any) -> str | None:
+    if pd.isna(value):
+        return None
+    address = str(value).strip()
+    if not address or address.lower() == "nan":
+        return None
+    return address
+
+
+def geocode_missing_address_row(address_col: str = "full_road_address") -> dict[str, Any]:
+    return {
+        address_col: pd.NA,
+        "geocode_status": "missing_address",
+        "matched_address": pd.NA,
+        "road_address": pd.NA,
+        "jibun_address": pd.NA,
+        "latitude": pd.NA,
+        "longitude": pd.NA,
+        "error_message": "address is missing or blank",
+    }
+
+
 def test_naver_geocoding(address: str = "서울특별시 중구 세종대로 110") -> dict[str, Any]:
     client_id, client_secret = get_naver_credentials()
     headers = {
@@ -93,6 +125,11 @@ def geocode_address(
     address_col: str = "full_road_address",
     timeout: int = 10,
 ) -> dict[str, Any]:
+    normalized_address = normalize_address_value(address)
+    if normalized_address is None:
+        return geocode_missing_address_row(address_col=address_col)
+
+    address = normalized_address
     if is_too_coarse_address(address):
         return {
             address_col: address,
@@ -226,6 +263,29 @@ def load_existing_cache(path: Path) -> pd.DataFrame:
     return pd.read_csv(path, encoding="utf-8-sig")
 
 
+def prepare_geocode_result(
+    rows: list[dict[str, Any]],
+    address_col: str,
+) -> pd.DataFrame:
+    result = pd.DataFrame(rows)
+    for column in [address_col, *GEOCODE_RESULT_COLUMNS]:
+        if column not in result.columns:
+            result[column] = pd.NA
+    result = result.drop_duplicates(subset=[address_col], keep="last")
+    result = result.sort_values(address_col).reset_index(drop=True)
+    return result
+
+
+def save_geocode_rows(
+    rows: list[dict[str, Any]],
+    output_path: Path,
+    address_col: str,
+) -> pd.DataFrame:
+    result = prepare_geocode_result(rows, address_col)
+    result.to_csv(output_path, index=False, encoding="utf-8-sig")
+    return result
+
+
 def geocode_unique_addresses(
     input_path: Path,
     output_path: Path,
@@ -236,15 +296,14 @@ def geocode_unique_addresses(
     max_workers: int = 5,
     max_retries: int = 3,
     retry_base_delay: float = 1.0,
+    retry_cache_statuses: tuple[str, ...] = RETRYABLE_CACHE_STATUSES,
 ) -> pd.DataFrame:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     source = pd.read_csv(input_path, encoding="utf-8-sig", usecols=[address_col])
+    normalized_addresses = source[address_col].map(normalize_address_value)
+    missing_address_count = normalized_addresses.isna().sum()
     addresses = (
-        source[address_col]
-        .dropna()
-        .astype(str)
-        .str.strip()
-        .loc[lambda series: series.ne("")]
+        normalized_addresses.dropna()
         .drop_duplicates()
         .sort_values()
         .tolist()
@@ -255,22 +314,28 @@ def geocode_unique_addresses(
     cache = load_existing_cache(output_path)
     cached_addresses = set()
     if not force and not cache.empty and address_col in cache.columns:
+        cache[address_col] = cache[address_col].map(normalize_address_value)
         if "geocode_status" in cache.columns:
-            reusable_cache = cache[cache["geocode_status"].ne("error")]
+            reusable_cache = cache[
+                ~cache["geocode_status"].fillna("").isin(retry_cache_statuses)
+            ]
         else:
             reusable_cache = cache
-        cached_addresses = set(reusable_cache[address_col].dropna().astype(str))
+        cached_addresses = set(reusable_cache[address_col].dropna())
 
-    client_id, client_secret = get_naver_credentials()
-    validate_naver_geocoding()
     rows = [] if force or cache.empty else cache.to_dict("records")
     pending = [address for address in addresses if address not in cached_addresses]
 
+    if missing_address_count:
+        print(f"missing or blank addresses skipped: {missing_address_count:,} rows")
     if pending:
         print(
             f"geocoding pending addresses: {len(pending):,} "
-            f"(max_workers={max_workers}, max_retries={max_retries})"
+            f"(max_workers={max_workers}, max_retries={max_retries}, "
+            f"retry_cache_statuses={retry_cache_statuses})"
         )
+        client_id, client_secret = get_naver_credentials()
+        validate_naver_geocoding()
 
     completed = 0
     max_workers = max(1, max_workers)
@@ -301,15 +366,15 @@ def geocode_unique_addresses(
             completed += 1
             if completed % 100 == 0 or completed == len(pending):
                 print(f"geocoded {completed:,}/{len(pending):,} pending addresses")
-                pd.DataFrame(rows).to_csv(output_path, index=False, encoding="utf-8-sig")
+                save_geocode_rows(rows, output_path, address_col)
 
         if not pending:
-            pd.DataFrame(rows).to_csv(output_path, index=False, encoding="utf-8-sig")
+            save_geocode_rows(rows, output_path, address_col)
 
-    result = pd.DataFrame(rows)
-    result = result.drop_duplicates(subset=[address_col], keep="last")
-    result = result.sort_values(address_col).reset_index(drop=True)
-    result.to_csv(output_path, index=False, encoding="utf-8-sig")
+    result = save_geocode_rows(rows, output_path, address_col)
+    if "geocode_status" in result.columns:
+        print("geocode status summary:")
+        print(result["geocode_status"].value_counts(dropna=False).to_string())
     return result
 
 
@@ -321,16 +386,33 @@ def merge_coordinates(
 ) -> pd.DataFrame:
     apartments = pd.read_csv(apartment_path, encoding="utf-8-sig")
     coordinates = pd.read_csv(geocoded_path, encoding="utf-8-sig")
-    apartments[address_col] = apartments[address_col].astype(str).str.strip()
-    coordinates[address_col] = coordinates[address_col].astype(str).str.strip()
+    apartments["_geocode_key"] = apartments[address_col].map(normalize_address_value)
+    coordinates["_geocode_key"] = coordinates[address_col].map(normalize_address_value)
+
     coordinate_cols = [
-        address_col,
-        "geocode_status",
-        "matched_address",
-        "latitude",
-        "longitude",
+        column for column in GEOCODE_RESULT_COLUMNS if column in coordinates.columns
     ]
-    merged = apartments.merge(coordinates[coordinate_cols], on=address_col, how="left")
+    merged = apartments.merge(
+        coordinates[["_geocode_key", *coordinate_cols]],
+        on="_geocode_key",
+        how="left",
+    )
+    for column in GEOCODE_RESULT_COLUMNS:
+        if column not in merged.columns:
+            merged[column] = pd.NA
+
+    missing_address_mask = merged["_geocode_key"].isna()
+    unmatched_address_mask = (
+        merged["_geocode_key"].notna() & merged["geocode_status"].isna()
+    )
+    merged.loc[missing_address_mask, "geocode_status"] = "missing_address"
+    merged.loc[unmatched_address_mask, "geocode_status"] = "not_geocoded"
+    if "error_message" not in merged.columns:
+        merged["error_message"] = pd.NA
+    merged["error_message"] = merged["error_message"].astype("object")
+    merged.loc[missing_address_mask, "error_message"] = "address is missing or blank"
+
+    merged = merged.drop(columns=["_geocode_key"])
     output_path.parent.mkdir(parents=True, exist_ok=True)
     merged.to_csv(output_path, index=False, encoding="utf-8-sig")
     return merged
@@ -375,6 +457,11 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="재시도 지수 백오프의 기본 대기 시간(초)입니다.",
     )
+    parser.add_argument(
+        "--retry-cache-statuses",
+        default="error",
+        help="기존 캐시에서 다시 요청할 geocode_status 목록입니다. 쉼표로 구분합니다.",
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--force", action="store_true")
     parser.add_argument(
@@ -398,6 +485,11 @@ def main() -> None:
             max_workers=args.max_workers,
             max_retries=args.max_retries,
             retry_base_delay=args.retry_base_delay,
+            retry_cache_statuses=tuple(
+                status.strip()
+                for status in args.retry_cache_statuses.split(",")
+                if status.strip()
+            ),
         )
     merged = merge_coordinates(
         apartment_path=args.input,
