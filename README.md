@@ -118,15 +118,11 @@ seoul-apartment-price-prediction/
 │   ├── 02_data_cleaning.ipynb        # 기본 정제 + 기본 파생 변수 (연식, ㎡당 가격, 주소 후보)
 │   ├── 03_feature_engineering.ipynb  # 외부 데이터 결합 및 추가 파생 변수 생성
 │   ├── 04_eda.ipynb                  # 탐색적 데이터 분석 및 시각화
-│   └── 05_modeling.ipynb             # 머신러닝 모델 학습 및 평가
-├── src/                              # 반복 사용할 Python 코드
-│   ├── collect.py                    # 데이터 수집 함수
-│   ├── preprocess.py                 # 전처리 함수
-│   ├── features.py                   # 파생 변수 생성 함수
-│   └── modeling.py                   # 모델 학습, 평가 관련 함수
+│   ├── 05_modeling.ipynb             # 머신러닝 모델 학습 및 평가
+│   ├── 06_model_finalization.ipynb   # 최종 모델 후보 튜닝 및 평가
+│   └── 07_model_interpretation.ipynb # 최종 모델 해석
 ├── reports/                          # 보고서 및 발표 자료 관련 산출물
-│   ├── figures/                      # EDA, 모델 결과 시각화 이미지
-│   └── final_report.md               # 최종 보고서 초안
+│   └── figures/                      # EDA, 모델 결과 시각화 이미지
 ├── requirements.txt                  # 프로젝트 실행에 필요한 Python 패키지 목록
 └── .gitignore                        # Git에 올리지 않을 파일 및 폴더 설정
 ```
